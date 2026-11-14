@@ -32,11 +32,13 @@ static struct drm_panel_follower hx_panel_follower;
 static bool hx_follows_panel;
 struct device *g_device;
 
-static bool himax_ft8722_panel_selected(void)
+static bool himax_panel_selected(void)
 {
-	return saved_command_line &&
-	       strstr(saved_command_line,
-		      "ft8722_fhdp_wt_dsi_vdo_cphy_90hz_truly");
+	if (!saved_command_line)
+		return false;
+
+	return strstr(saved_command_line, "hx83112f") ||
+	       strstr(saved_command_line, "himax");
 }
 
 int himax_dev_set(struct himax_ts_data *ts)
@@ -147,6 +149,11 @@ void himax_int_enable(int enable)
 	unsigned long irqflags;
 
 	spin_lock_irqsave(&ts->irq_lock, irqflags);
+	/* A firmware/self-test worker must not re-enable an IRQ during removal. */
+	if (enable == 1 && READ_ONCE(ts->removing)) {
+		spin_unlock_irqrestore(&ts->irq_lock, irqflags);
+		return;
+	}
 	if (enable == 1 && atomic_read(&ts->irq_state) == 0) {
 		atomic_set(&ts->irq_state, 1);
 		enable_irq(ts->hx_irq);
@@ -226,6 +233,7 @@ static int himax_panel_prepared(struct drm_panel_follower *follower)
 {
 	int ret;
 
+	dev_info(g_device, "panel prepared; starting HX83112F initialization\n");
 	/* Zero-flash firmware may only be loaded while the shared rails are on. */
 	if (!g_hx_chip_inited) {
 		ret = himax_chip_common_init();
@@ -261,10 +269,15 @@ static int himax_hx83112f_probe(struct spi_device *spi)
 	struct himax_ts_data *ts;
 	int ret;
 
-	if (himax_ft8722_panel_selected()) {
-		dev_dbg(&spi->dev, "skipping HX83112F for FT8722 panel\n");
+	if (!himax_panel_selected()) {
+		dev_info(&spi->dev, "skipping HX83112F for non-Himax panel\n");
 		return -ENODEV;
 	}
+
+	dev_info(&spi->dev, "HX83112F panel selected; SPI mode 3, IRQ %d\n",
+		 spi->irq);
+	if (spi->irq <= 0)
+		return dev_err_probe(&spi->dev, -EINVAL, "missing touch IRQ\n");
 
 	hx_reset_gpio = devm_gpiod_get_optional(&spi->dev, "reset", GPIOD_ASIS);
 	if (IS_ERR(hx_reset_gpio))
@@ -284,6 +297,8 @@ static int himax_hx83112f_probe(struct spi_device *spi)
 	}
 
 	hx_spi = spi;
+	/* The Android driver operates this controller at 1 MHz. */
+	spi->max_speed_hz = 1000000;
 	spi->mode = SPI_MODE_3;
 	spi->bits_per_word = 8;
 	ret = spi_setup(spi);
@@ -300,12 +315,16 @@ static int himax_hx83112f_probe(struct spi_device *spi)
 	g_fw_mp_upgrade_name = "Himax_firmware_mp_jdi.bin";
 
 	hx_follows_panel = drm_is_panel_follower(&spi->dev);
+	dev_info(&spi->dev, "panel follower relationship: %s\n",
+		 hx_follows_panel ? "present" : "missing");
 	if (hx_follows_panel) {
 		hx_panel_follower.funcs = &himax_panel_follower_funcs;
 		ret = drm_panel_add_follower(&spi->dev, &hx_panel_follower);
 		if (ret)
 			goto err;
 	} else {
+		dev_warn(&spi->dev,
+			 "panel follower unavailable; initializing after SPI probe\n");
 		ret = himax_chip_common_init();
 		if (ret < 0)
 			goto err;
